@@ -5,7 +5,7 @@ import json
 import os
 import time
 import re
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -14,9 +14,10 @@ from sentence_transformers import SentenceTransformer
 from app.services.milvus_client import (
     ensure_collection, ensure_loaded, search_vectors
 )
+from app.services.faiss_cache import FAISSCache
 from app.utils.timing import timed
 
-# ----------------- ENV / Config -----------------
+
 EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 COLLECTION_PREFIX = os.getenv("MILVUS_COLLECTION_PREFIX", "lease_chunks")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
@@ -27,17 +28,8 @@ HY_ENTITY_EXTRA_QUERIES = int(os.getenv("HYBRID_ENTITY_EXTRA_QUERIES", "3"))
 HY_MAX_QUERY_VARIANTS = int(os.getenv("HYBRID_MAX_QUERY_VARIANTS", "10"))
 HY_PER_QUERY_K_MAIN = int(os.getenv("HYBRID_PER_QUERY_K_MAIN", "8"))
 HY_PER_QUERY_K_SIDE = int(os.getenv("HYBRID_PER_QUERY_K_SIDE", "4"))
-HY_ENABLE_RESULT_CACHE = os.getenv("HYBRID_ENABLE_CACHE", "true").lower() == "true"
-HY_CACHE_MAX = int(os.getenv("HYBRID_CACHE_MAX", "256"))
-HY_CACHE_TTL_SEC = int(os.getenv("HYBRID_CACHE_TTL_SEC", "600"))
-
-# ----------------- Helpers -----------------
 
 def _score_from_distance(distance: float) -> float:
-    """
-    Milvus returns 'distance' where, for IP (cosine with normalized vecs), larger = more similar.
-    We clamp into [0,1]. For L2, you could map via 1/(1+d), but we're standardizing on IP+normalized.
-    """
     try:
         d = float(distance)
     except Exception:
@@ -61,10 +53,6 @@ def _dedupe_by_base_id(chunks: List[Dict]) -> List[Dict]:
     return out
 
 def _keyword_overlap_boost(q: str, text: str, header: str = "") -> float:
-    """
-    Very fast lexical signal to complement embeddings.
-    - rewards shared rare-ish tokens; harmless for speed.
-    """
     q_tokens = {t for t in re.findall(r"[a-z0-9]+", q.lower()) if len(t) > 2}
     if not q_tokens: 
         return 0.0
@@ -87,15 +75,11 @@ def _is_financial_intent(q: str) -> bool:
     ql = q.lower()
     return any(w in ql for w in ["rent", "payment", "amount", "price", "cost", "deposit", "security", "service charge", "monthly", "escalation"])
 
+
 class EnhancedRetrieverMilvus:
     """
-    Milvus-backed retriever with robust, LLM-free "Hybrid++" path:
-      - domain-aware query expansion (not just a few hardcoded swaps)
-      - entity-first seeding (when applicable)
-      - coverage top-up across main/clauses
-      - keyword-overlap boosting + metadata-aware nudges
-      - dedupe by base-id; basic diversity guard
-      - tiny in-process result cache (fast hot path)
+    Milvus-backed retriever with Hybrid++ search.
+    Now uses FAISSCache for semantic result caching.
     """
 
     def __init__(self, collection_prefix: str = COLLECTION_PREFIX):
@@ -119,16 +103,9 @@ class EnhancedRetrieverMilvus:
             "deposit": ["security deposit", "refundable deposit", "security"],
         }
 
-        self._cache: OrderedDict[str, Tuple[float, Tuple[List[Dict], str, List[Dict]]]] = OrderedDict()
+        self.cache = FAISSCache(dim=EMBED_DIM, index_type="Flat")
 
     def _expand_query(self, query: str) -> List[str]:
-        """
-        More general expansion:
-         - synonym/alias swaps
-         - role prompts (entities/clauses/main)
-         - question phrasing variants (list/count/who/what)
-        Bounded to HY_MAX_QUERY_VARIANTS for speed.
-        """
         ql = query.strip()
         variants = [ql]
         low = ql.lower()
@@ -185,7 +162,6 @@ class EnhancedRetrieverMilvus:
 
     def _merge_and_dedup(self, lists: List[List[Dict[str, Any]]], k: int) -> List[Dict[str, Any]]:
         flat = [r for L in lists for r in L]
-        # light metadata-aware boost + keyword overlap will run later
         flat.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         seen_ids = set()
         out = []
@@ -199,9 +175,6 @@ class EnhancedRetrieverMilvus:
         return out
 
     def _diversity_filter(self, chunks: List[Dict], want: int) -> List[Dict]:
-        """
-        Avoid too many near-duplicates from the same header/section; cheap heuristic.
-        """
         if len(chunks) <= want:
             return chunks
         seen_key = {}
@@ -210,7 +183,7 @@ class EnhancedRetrieverMilvus:
             md = c.get("metadata", {}) or {}
             key = (md.get("doc_id", ""), md.get("header", ""), md.get("clause_type", ""))
             cnt = seen_key.get(key, 0)
-            if cnt < 2:  # allow up to 2 from same section
+            if cnt < 2:
                 out.append(c)
                 seen_key[key] = cnt + 1
             if len(out) >= want:
@@ -224,7 +197,6 @@ class EnhancedRetrieverMilvus:
             header = md.get("header", "") or ""
             boost = _keyword_overlap_boost(q, r.get("text", ""), header)
 
-            # domain nudges
             ct = (md.get("clause_type") or "").lower()
             if _is_financial_intent(low) and ct in ("rent", "financial", "security"):
                 boost += 0.06
@@ -300,80 +272,19 @@ class EnhancedRetrieverMilvus:
         context = "\n---\n".join(pieces)
         return context, sources
 
-    # ---------- Public APIs ----------
-    def retrieve_comprehensive(
-        self,
-        question: str,
-        k: int = 12,
-        where: Optional[Dict[str, Any]] = None,
-        use_mmr: bool = True,
-        **kwargs
-    ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
-        # kept for compatibility with previous code paths
-        queries = self._expand_query(question)
-        expr = None
-        results_sets: List[List[Dict[str, Any]]] = []
-        qvecs = self._embed(queries)
-        for q, v in zip(queries, qvecs):
-            main = self._search_one(self.col_main, v, k=HY_PER_QUERY_K_MAIN, where_expr=expr)
-            ents = self._search_one(self.col_entities, v, k=HY_PER_QUERY_K_SIDE, where_expr=expr)
-            claus = self._search_one(self.col_clauses, v, k=HY_PER_QUERY_K_SIDE, where_expr=expr)
-            pack = self._apply_boosts(q, main + ents + claus)
-            results_sets.append(pack)
-
-        merged = self._merge_and_dedup(results_sets, k=max(k*3, 24))
-        final = merged[:k]
-        context, sources = self._build_enhanced_context(final)
-        return final, context, sources
-
-    def retrieve_entities_focused(self, question: str, k: int = 8) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
-        qlist = [
-            question,
-            f"entities and parties: {question}",
-            f"companies and parties: {question}",
-            f"lessor and lessee: {question}",
-        ]
-        vecs = self._embed(qlist)
-
-        results: List[Dict[str, Any]] = []
-        for v, q in zip(vecs, qlist):
-            ents = self._search_one(self.col_entities, v, k=k*2)
-            main = self._search_one(self.col_main, v, k=k)
-            pack = self._apply_boosts(q, ents + main)
-            results.extend(pack)
-
-        # dedup & top-k
-        seen = set()
-        out = []
-        for r in sorted(results, key=lambda x: x["score"], reverse=True):
-            if r["id"] not in seen:
-                seen.add(r["id"])
-                out.append(r)
-            if len(out) >= k:
-                break
-
-        ctx, src = self._build_enhanced_context(out)
-        return out, ctx, src
-
-    # -------- New: Robust, LLM-free Hybrid++ --------
     def retrieve_hybrid_robust(self, question: str, k: int = 12) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
-        """
-        Generalized, fast path for CRE questions (entities, dates, rent, terms, etc.)
-        No LLM calls. Uses domain-aware expansions, IP+normalized embeddings, lexical boost,
-        entity seeding (if applicable), coverage top-up, dedupe+diversity, micro-cache.
-        """
-        cache_key = None
-        if HY_ENABLE_RESULT_CACHE:
-            cache_key = f"{question}::{k}"
-            now = time.time()
-            # evict expired & maintain LRU
-            if cache_key in self._cache:
-                ts, payload = self._cache.pop(cache_key)
-                if now - ts < HY_CACHE_TTL_SEC:
-                    # refresh LRU position
-                    self._cache[cache_key] = (ts, payload)
-                    return payload
+        qvec = self._embed([question])[0]
 
+        # 1) Try FAISS cache first
+        cache_results = self.cache.search([qvec], k=1)
+        if cache_results:
+            hit_id = cache_results[0]["id"]
+            # ID stored as query text
+            if hit_id == question:
+                print(f"[cache hit] {question}")
+                return cache_results[0].get("payload")
+
+        # 2) Otherwise, do full retrieval
         with timed("hybrid.expand_embed"):
             queries = self._expand_query(question)
             qvecs = self._embed(queries)
@@ -382,41 +293,33 @@ class EnhancedRetrieverMilvus:
         results_sets: List[List[Dict[str, Any]]] = []
 
         with timed("hybrid.seed_and_topup"):
-            # 1) seed: entity-first if likely entity question
             if entity_intent:
                 for q, v in zip(queries[:1 + HY_ENTITY_EXTRA_QUERIES], qvecs[:1 + HY_ENTITY_EXTRA_QUERIES]):
                     ents = self._search_one(self.col_entities, v, k=max(k, HY_PER_QUERY_K_MAIN))
                     pack = self._apply_boosts(q, ents)
                     results_sets.append(pack)
 
-            # 2) coverage top-up: always query main/clauses with all variants (capped)
             for q, v in zip(queries, qvecs):
                 main = self._search_one(self.col_main, v, k=HY_PER_QUERY_K_MAIN)
                 claus = self._search_one(self.col_clauses, v, k=HY_PER_QUERY_K_SIDE)
                 pack = self._apply_boosts(q, main + claus)
                 results_sets.append(pack)
 
-        # 3) merge & dedupe
         with timed("hybrid.merge"):
             merged = []
             for pack in results_sets:
                 merged.extend(pack)
-            # sort by boosted score first
             merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             merged = _dedupe_by_base_id(merged)
 
-        # 4) ensure coverage: if we didn’t reach enough unique after seed+topup, keep adding
-        # (this is cheap because each _search_one already limited k tightly)
         if len(merged) < max(k, HY_TOPUP_MIN_UNIQUE):
             with timed("hybrid.topup"):
                 need = max(k, HY_TOPUP_MIN_UNIQUE) - len(merged)
-                # re-run top variants against main quickly
                 for q, v in zip(queries, qvecs):
                     if need <= 0:
                         break
                     extra = self._search_one(self.col_main, v, k=need)
                     extra = self._apply_boosts(q, extra)
-                    # add only new base-ids
                     seen = {_strip_variant_suffix(m["id"]) for m in merged}
                     for e in extra:
                         if _strip_variant_suffix(e["id"]) not in seen:
@@ -426,7 +329,6 @@ class EnhancedRetrieverMilvus:
                             if need <= 0:
                                 break
 
-        # 5) final sort & diversity guard
         merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         merged = self._diversity_filter(merged, want=max(k*2, k))
         final = merged[:k]
@@ -434,12 +336,10 @@ class EnhancedRetrieverMilvus:
         with timed("hybrid.merge_context"):
             context, sources = self._build_enhanced_context(final)
 
-        # cache it
-        if HY_ENABLE_RESULT_CACHE:
-            self._cache[cache_key] = (time.time(), (final, context, sources))
-            # enforce size
-            while len(self._cache) > HY_CACHE_MAX:
-                self._cache.popitem(last=False)
+        # 3) Store results in FAISS cache
+        self.cache.add([qvec], [question])
+        self.cache.save()
 
+        payload = (final, context, sources)
         print(f"[hybrid] entity_intent={entity_intent} unique~={len(final)} final_k={k}")
-        return final, context, sources
+        return payload
