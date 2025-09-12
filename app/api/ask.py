@@ -10,9 +10,11 @@ from pydantic import BaseModel, Field
 router = APIRouter(tags=["rag"])
 log = logging.getLogger(__name__)
 
-# --- imports for retrieval & local LLM ---
+# --- retrieval (Milvus; hybrid/comprehensive/multi_hop inside) ---
 from app.services.llm_enhanced_retrieval import enterprise_retrieve
-from app.services.local_llm import LocalLlama  # llama.cpp wrapper (only used if use_gemini=True)
+
+# --- TensorRT-LLM (generation when use_gemini = true) ---
+from app.services.trt_runner import get_trt_llm  # <-- use TRT-LLM, not llama.cpp
 
 # --- optional chat memory (safe import; file works even if memory module not present) ---
 try:
@@ -41,9 +43,12 @@ class AskRequest(BaseModel):
     retrieval_method: str = Field(
         "hybrid", description="comprehensive|hybrid|multi_hop"
     )
-    max_new_tokens: int = Field(500, ge=1, le=1024)
+    max_new_tokens: int = Field(500, ge=1, le=2048)
     temperature: float = Field(0.1, ge=0.0, le=1.0)
-    use_gemini: bool = Field(False, description="If true, use local LLaMA to generate an answer; if false, return structured fallback")
+    use_gemini: bool = Field(
+        False,
+        description="If true, generate with TensorRT-LLM; if false, return structured fallback (no generation)."
+    )
 
     # Chat memory (optional)
     conversation_id: Optional[str] = Field(
@@ -124,9 +129,10 @@ def _format_chat_history(history: Optional[List[Dict[str, str]]]) -> str:
     return "\n".join(lines)
 
 
-def _llama_answer(question: str, context: str, chat_history_block: str, temp: float, max_tokens: int) -> str:
+def _trt_answer(question: str, context: str, chat_history_block: str, temp: float, max_tokens: int) -> str:
     """
-    Build the final prompt and call local LLaMA if requested.
+    Build the prompt and call TensorRT-LLM (on-device, fast).
+    The TRT runner wraps the chat template and decoding.
     """
     history_section = f"\nCHAT HISTORY (most recent first):\n{chat_history_block}\n" if chat_history_block else ""
     prompt = (
@@ -142,8 +148,8 @@ def _llama_answer(question: str, context: str, chat_history_block: str, temp: fl
         "- Be concise but complete.\n"
         "ANSWER:\n"
     )
-    llm = LocalLlama()
-    return llm.gen(prompt, temp=temp, max_tokens=max_tokens)
+    trt = get_trt_llm()
+    return trt.gen(prompt=prompt, temp=temp, max_tokens=max_tokens)
 
 
 # ------------------ Route ------------------
@@ -151,7 +157,7 @@ def _llama_answer(question: str, context: str, chat_history_block: str, temp: fl
 @router.post(
     "/ask",
     response_model=AskResponse,
-    summary="Ask with enterprise retrieval + optional local LLaMA",
+    summary="Ask with enterprise retrieval + optional TensorRT-LLM generation",
     openapi_extra={
         "requestBody": {
             "content": {
@@ -205,7 +211,7 @@ def ask(req: AskRequest) -> AskResponse:
     # 2) If nothing found, answer minimally and record turn
     if not chunks:
         answer = "No relevant information found in the document to answer your question."
-        used_model = "No model used"
+        used_model = "none"
 
         # --- memory: record both question and assistant reply ---
         if CHAT_MEMORY_AVAILABLE and req.conversation_id and req.user_id:
@@ -230,15 +236,15 @@ def ask(req: AskRequest) -> AskResponse:
     # 4) Generate the answer or return structured fallback
     try:
         if req.use_gemini:
-            # Local LLaMA generation path
-            ans = _llama_answer(req.question, context_text, history_block, req.temperature, req.max_new_tokens)
-            used_model = "local-llama"
+            # TensorRT-LLM generation path
+            ans = _trt_answer(req.question, context_text, history_block, req.temperature, req.max_new_tokens)
+            used_model = "trt-llm"
         else:
-            # No LLM generation path (fast). Still persists memory so multi-turn works.
-            ans = f"Found {len(chunks)} relevant sections. (Generation disabled; set use_gemini=true to generate a full answer.)"
+            # No generation path (fast). Still persists memory so multi-turn works.
+            ans = f"Found {len(chunks)} relevant sections (generation disabled)."
             used_model = "structured_fallback"
     except Exception as e:
-        # Minimal structured fallback if LLM errors
+        # Minimal structured fallback if generation errors
         ans = f"Found {len(chunks)} relevant sections.\n(Generation fallback: {str(e)})"
         used_model = "structured_fallback"
 
