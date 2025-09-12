@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 # from app.services.enhanced_retriever import EnhancedRetriever
 from app.services.enhanced_retriever_milvus import EnhancedRetrieverMilvus as EnhancedRetriever
-from app.services.local_llm import LocalLlama, coerce_json
-from app.utils.timing import timed  # << added: timing blocks
+from app.services.local_llm import coerce_json  # NOTE: don't import LocalLlama here to avoid accidental init
+from app.utils.timing import timed  # timing blocks
 
 log = logging.getLogger(__name__)
 
@@ -76,15 +76,26 @@ def _merge_unique_by_base_id(chunks: List[Dict]) -> List[Dict]:
 # ---------------- LLM wrapper ----------------
 
 class _LocalLLM:
+    """
+    Lazy loader for LocalLlama. We only instantiate the model when gen() is called.
+    This prevents MODEL_PATH errors on hybrid retrieval (which doesn't use the LLM).
+    """
     def __init__(self):
         self.model_name = _DEFAULT_MODEL_NAME
-        self.llm = LocalLlama()
+        self._llm = None  # defer creation
+
+    def _ensure_llm(self):
+        if self._llm is None:
+            # Import here to avoid any side-effects at module import time
+            from app.services.local_llm import LocalLlama
+            self._llm = LocalLlama()
 
     def gen(self, prompt: str, temp: float = 0.2, max_tokens: int = 1024, retries: int = 1) -> str:
+        self._ensure_llm()
         err: Optional[Exception] = None
         for _ in range(retries + 1):
             try:
-                return self.llm.gen(prompt, temp=temp, max_tokens=max_tokens)
+                return self._llm.gen(prompt, temp=temp, max_tokens=max_tokens)
             except Exception as e:
                 err = e
                 time.sleep(0.4)
@@ -103,7 +114,7 @@ class LLMEnhancedRetriever:
     """
 
     def __init__(self, collection_prefix: str = "lease_chunks"):
-        self.llm = _LocalLLM()
+        self.llm = _LocalLLM()  # <-- lazy; safe for hybrid
         self.base_retriever = EnhancedRetriever(collection_prefix)
 
     # -------- Query analysis --------
@@ -364,7 +375,6 @@ If anything is missing to fully answer, return ONLY a JSON array of follow-up se
         Requires EnhancedRetrieverMilvus.retrieve_hybrid_robust(...)
         """
         with timed("retrieval(hybrid)"):
-            # Calls the optimized Milvus-only path (entity-first + coverage top-up)
             final, ctx, src = self.base_retriever.retrieve_hybrid_robust(question, k)
         return final, ctx, src
 

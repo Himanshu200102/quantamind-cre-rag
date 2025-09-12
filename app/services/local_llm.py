@@ -149,3 +149,7 @@ class LocalLlama:
 
         self._resp_cache[key] = text
         return text
+        
+    def summarize(self, text: str, max_tokens: int = 200) -> str:
+        prompt = f"Summarize concisely:\n\n{text}\n\nSummary:"
+        return self.gen(prompt, temp=0.1, max_tokens=max_tokens)
